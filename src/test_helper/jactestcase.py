@@ -47,7 +47,8 @@ class JACTestCase(unittest.TestCase):
                 errors.append(f"❌ {e.args[0]}")
 
         if len(errors) > 0:
-            self.fail(f"Code style errors:\n{"\n".join(errors)}")
+            joined = "\n".join(errors)
+            self.fail(f"Code style errors:\n{joined}")
 
     def assertFunctionReturns(self, student_function, filename):
         source_code = inspect.getsource(student_function)
