@@ -1,5 +1,23 @@
 
 
+    
+
+def try_me():
+    pair = get_parity
+    print(pair)
+
+def get_parity(num):
+    if num % 2 == 0:
+        return True
+    else:
+        return False
+    
+def does_return(thing):
+    for i in range(10):
+        if thing % 3 == 0:
+            return 2
+    return
+
 def my_function():
     print("hello world!")
 
@@ -14,7 +32,3 @@ def my_function():
     def MyFunction(a: int):
         print("yuck")    
 
-
-def get_parity(num):
-    if num % 2 == 0:
-        return True

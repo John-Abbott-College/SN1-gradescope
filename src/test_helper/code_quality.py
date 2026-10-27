@@ -160,16 +160,23 @@ def check_no_list_comprehensions(tree: ast.AST, filename: str) -> None:
 # ---------------------------------------------------------
 # Function assigned to a variable (instead of calling)
 # ---------------------------------------------------------
+
 def check_no_function_assignments(tree: ast.AST, filename: str) -> None:
+    func_names = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    func_names |= {n for n in dir(builtins) if callable(getattr(builtins, n))}
+
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            # If RHS is a bare name (and not a Call), it might be a function reference assignment
-            if isinstance(node.value, ast.Name):
-                raise CodeQualityError(
-                    filename, node.lineno,
-                    "Assigning a function reference to a variable instead of calling it is not allowed.",
-                    _get_line(tree, node)
-                )
+        if (isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in func_names):
+            raise CodeQualityError(
+                filename, node.lineno,
+                f"It looks like you're trying to call the function {node.value.id}() but forgot the parentheses ( )",
+                _get_line(tree, node)
+            )
 
 # ---------------------------------------------------------
 # Do not allow definition of classes
@@ -187,42 +194,111 @@ def check_no_classes(tree: ast.AST, filename: str) -> None:
 # ---------------------------------------------------------
 # All paths in a function must return
 # ---------------------------------------------------------
+def _is_constant_true(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and bool(node.value)
 
-def _has_guaranteed_return(node: ast.AST) -> bool:
-    """Helper to recursively check if a statement or block guarantees a return or raise."""
-    if isinstance(node, ast.Return):
+
+def _contains_break(stmts: list[ast.stmt]) -> bool:
+    """True if these statements contain a `break` that exits the enclosing loop."""
+    for stmt in stmts:
+        if isinstance(stmt, ast.Break):
+            return True
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+            # A break in an inner loop's body belongs to that loop,
+            # but one in its else clause belongs to ours.
+            if _contains_break(stmt.orelse):
+                return True
+            continue
+        blocks = [
+            getattr(stmt, "body", []),
+            getattr(stmt, "orelse", []),
+            getattr(stmt, "finalbody", []),
+        ]
+        blocks += [h.body for h in getattr(stmt, "handlers", [])]
+        blocks += [c.body for c in getattr(stmt, "cases", [])]
+        if any(_contains_break(block) for block in blocks):
+            return True
+    return False
+
+
+def _block_always_exits(stmts: list[ast.stmt]) -> bool:
+    """A block always exits if any statement in it does (the rest is unreachable)."""
+    return any(_always_exits(stmt) for stmt in stmts)
+
+
+def _always_exits(stmt: ast.stmt) -> bool:
+    """True if control can never continue past this statement."""
+    if isinstance(stmt, (ast.Return, ast.Raise)):
         return True
-    elif isinstance(node, ast.Raise):
-        return True
-    elif isinstance(node, ast.If):
-        has_else = len(node.orelse) > 0
-        if not has_else:
-            return False
-        
-        if_returns = any(_has_guaranteed_return(stmt) for stmt in node.body)
-        else_returns = any(_has_guaranteed_return(stmt) for stmt in node.orelse)
-        return if_returns and else_returns
-    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
-        if not node.body:
-            return False
-        return _has_guaranteed_return(node.body[-1])
-    
+
+    if isinstance(stmt, ast.If):
+        return _block_always_exits(stmt.body) and _block_always_exits(stmt.orelse)
+
+    if isinstance(stmt, (ast.With, ast.AsyncWith)):
+        return _block_always_exits(stmt.body)
+
+    if isinstance(stmt, ast.Try):
+        if _block_always_exits(stmt.finalbody):
+            return True
+        # The try body (plus else clause) and every except handler must all exit
+        return (_block_always_exits(stmt.body + stmt.orelse)
+                and all(_block_always_exits(h.body) for h in stmt.handlers))
+
+    if isinstance(stmt, (ast.For, ast.AsyncFor)):
+        # The loop can run zero times, so only the else clause can save us
+        return _block_always_exits(stmt.orelse) and not _contains_break(stmt.body)
+
+    if isinstance(stmt, ast.While):
+        if _is_constant_true(stmt.test):
+            return not _contains_break(stmt.body)    # `while True:` never falls through
+        return _block_always_exits(stmt.orelse) and not _contains_break(stmt.body)
+
+    if isinstance(stmt, ast.Match):
+        has_default = any(
+            isinstance(case.pattern, ast.MatchAs)
+            and case.pattern.pattern is None
+            and case.guard is None
+            for case in stmt.cases
+        )
+        return has_default and all(_block_always_exits(case.body) for case in stmt.cases)
+
+    return False
+
+
+def _returns_value(node: ast.Return) -> bool:
+    """True for `return x`; a bare `return` or `return None` doesn't count."""
+    if node.value is None:
+        return False
+    return not (isinstance(node.value, ast.Constant) and node.value.value is None)
+
+
+def _function_returns_value(func: ast.AST) -> bool:
+    """True if this function has a `return <value>`, ignoring nested defs and classes."""
+    stack = list(func.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Return) and _returns_value(node):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
     return False
 
 
 def check_return_paths(tree: ast.AST, filename: str) -> None:
-    """Check function matching the uniform (tree, filename) signature."""
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # You can optionally skip empty functions (like 'pass') or initializers if needed
-            if not _has_guaranteed_return(node):
+            if not _function_returns_value(node):
+                continue    # a void function is fine
+            if not _block_always_exits(node.body):
                 raise CodeQualityError(
                     filename=filename,
                     line_number=node.lineno,
                     offending_text=node.name,
                     message=f"Function '{node.name}' contains a code path that does not return a value."
                 )
-
 
 def _bound_name(node: ast.AST) -> str | None:
     """Return the name this node binds, or None if it doesn't bind one."""
@@ -341,5 +417,6 @@ DEFAULT_QUALITY_CHECKS = [
     check_no_classes,
     check_no_function_name_shadowing,
     check_no_builtin_shadowing,
-    check_no_overwritten_parameters
+    check_no_overwritten_parameters,
+    check_return_paths
 ]

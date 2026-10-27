@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "test_helper"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
     # list any external dependencies here, e.g., "pytest"
 ]
