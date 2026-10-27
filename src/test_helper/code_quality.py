@@ -1,4 +1,5 @@
 import ast
+import builtins
 import re
 
 class CodeQualityError(Exception):
@@ -76,7 +77,7 @@ def check_no_nested_functions(tree: ast.AST, filename: str) -> None:
             if self.func_depth > 0:
                 raise CodeQualityError(
                     filename, node.lineno,
-                    f"Nested function '{node.name}' is not allowed.",
+                    f"Nested functions are not allowed. Move {node.name}() so that it is not inside another function.",
                     _get_line(tree, node)
                 )
             self.func_depth += 1
@@ -85,20 +86,28 @@ def check_no_nested_functions(tree: ast.AST, filename: str) -> None:
 
     NestedVisitor().visit(tree)
 
-# ---------------------------------------------------------
-# Warning/Error on "== True" or "== False"
-# ---------------------------------------------------------
-def check_no_literal_comparisons(tree: ast.AST, filename: str) -> None:
+
+def _is_bool_literal(node: ast.AST) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, bool)
+
+
+def check_no_literal_bool_comparisons(tree: ast.AST, filename: str) -> None:
     for node in ast.walk(tree):
-        if isinstance(node, ast.Compare):
-            for op, comparator in zip(node.ops, node.comparators):
-                if isinstance(op, (ast.Eq, ast.NotEq)) and isinstance(comparator, ast.Constant):
-                    if comparator.value in (True, False):
-                        raise CodeQualityError(
-                            filename, node.lineno,
-                            "Comparison to True/False literal is restricted.",
-                            _get_line(tree, node)
-                        )
+        if not isinstance(node, ast.Compare):
+            continue
+
+        # Pair each operator with the operands on either side of it,
+        # which also handles chained comparisons like a == b == True
+        operands = [node.left, *node.comparators]
+        for op, left, right in zip(node.ops, operands, operands[1:]):
+            if isinstance(op, (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)) and (
+                _is_bool_literal(left) or _is_bool_literal(right)
+            ):
+                raise CodeQualityError(
+                    filename, node.lineno,
+                    "Don't explicitly compare with True or False",
+                    _get_line(tree, node)
+                )
 
 # ---------------------------------------------------------
 # Do not allow tuples
@@ -147,25 +156,6 @@ def check_no_list_comprehensions(tree: ast.AST, filename: str) -> None:
                 "Use of list comprehensions is not allowed.",
                 _get_line(tree, node)
             )
-
-# ---------------------------------------------------------
-# Parameter value is overwritten inside a function
-# ---------------------------------------------------------
-def check_no_parameter_overwrites(tree: ast.AST, filename: str) -> None:
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            param_names = {arg.arg for arg in node.args.args}
-            # Check statements in the function body for immediate/unconditional overwrites
-            for stmt in node.body:
-                for subnode in ast.walk(stmt):
-                    if isinstance(subnode, ast.Assign):
-                        for target in subnode.targets:
-                            if isinstance(target, ast.Name) and target.id in param_names:
-                                raise CodeQualityError(
-                                    filename, subnode.lineno,
-                                    f"Parameter '{target.id}' is overwritten inside function '{node.name}'.",
-                                    _get_line(tree, subnode)
-                                )
 
 # ---------------------------------------------------------
 # Function assigned to a variable (instead of calling)
@@ -232,7 +222,110 @@ def check_return_paths(tree: ast.AST, filename: str) -> None:
                     offending_text=node.name,
                     message=f"Function '{node.name}' contains a code path that does not return a value."
                 )
-            
+
+
+def _bound_name(node: ast.AST) -> str | None:
+    """Return the name this node binds, or None if it doesn't bind one."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        return node.id
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name
+    if isinstance(node, ast.arg):
+        return node.arg
+    if isinstance(node, ast.alias):
+        return node.asname or node.name.split(".")[0]
+    if isinstance(node, ast.ExceptHandler):
+        return node.name
+    return None
+
+
+# ---------------------------------------------------------
+# Don't declare variables/params with the same name as the
+# current function
+# ---------------------------------------------------------
+
+def check_no_function_name_shadowing(tree: ast.AST, filename: str) -> None:
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        for node in ast.walk(func):
+            if node is func:
+                continue    # the def itself obviously binds its own name
+
+            if _bound_name(node) == func.name:
+                raise CodeQualityError(
+                    filename, node.lineno,
+                    f"'{func.name}' is the name of the enclosing function "
+                    f"and shouldn't be reused for a variable or parameter.",
+                    _get_line(tree, node)
+                )
+
+
+# ---------------------------------------------------------
+# Don't declare variables/params with the same name as a
+# built-in function
+# ---------------------------------------------------------            
+
+def check_no_builtin_shadowing(tree: ast.AST, filename: str) -> None:
+    # Skip dunders like __name__ and __doc__, which students rarely touch
+    _BUILTIN_NAMES = {name for name in dir(builtins) if not name.startswith("_")}
+
+    for node in ast.walk(tree):
+        name = _bound_name(node)
+
+        if name in _BUILTIN_NAMES:
+            raise CodeQualityError(
+                filename, node.lineno,
+                f"'{name}' shadows a built-in Python name.",
+                _get_line(tree, node)
+            )
+
+
+def _reads_name(node: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)
+        for n in ast.walk(node)
+    )
+
+
+def _stores_name(node: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Store)
+        for n in ast.walk(node)
+    )
+
+# ---------------------------------------------------------
+# Don't modify a param's value before using it
+# --------------------------------------------------------- 
+def check_no_overwritten_parameters(tree: ast.AST, filename: str) -> None:
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        a = func.args
+        params = {p.arg for p in a.posonlyargs + a.args + a.kwonlyargs}
+        params -= {"self", "cls", "_"}
+
+        for param in params:
+            for stmt in func.body:
+                # A plain assignment that doesn't use the parameter's own value
+                if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None:
+                    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                    if (any(_stores_name(t, param) for t in targets)
+                            and not _reads_name(stmt.value, param)):
+                        raise CodeQualityError(
+                            filename, stmt.lineno,
+                            f"Parameter '{param}' is overwritten before its "
+                            f"value is used. Use the value that was passed in.",
+                            _get_line(tree, stmt)
+                        )
+
+                # Any other touch of the parameter means we can't say it was ignored
+                if _reads_name(stmt, param) or _stores_name(stmt, param):
+                    break
+
+
 # ---------------------------------------------------------
 # Runner list for unit tests
 # ---------------------------------------------------------
@@ -240,12 +333,13 @@ DEFAULT_QUALITY_CHECKS = [
     check_naming_conventions,
     check_variable_length,
     check_no_nested_functions,
-    check_no_literal_comparisons,
+    check_no_literal_bool_comparisons,
     check_no_tuples,
     check_no_dictionaries,
-    check_no_lists,
     check_no_list_comprehensions,
-    check_no_parameter_overwrites,
     check_no_function_assignments,
     check_no_classes,
+    check_no_function_name_shadowing,
+    check_no_builtin_shadowing,
+    check_no_overwritten_parameters
 ]
