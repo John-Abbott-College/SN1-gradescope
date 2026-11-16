@@ -32,3 +32,6 @@ def my_function():
     def MyFunction(a: int):
         print("yuck")    
 
+
+def func_with_params(a, c, b):
+    pass

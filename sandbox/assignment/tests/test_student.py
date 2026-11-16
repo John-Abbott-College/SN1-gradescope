@@ -7,3 +7,6 @@ class Tests(JACTestCase):
 
     def test_returns(self):
         self.assertFunctionReturns(student_file.get_parity, "student_file.py")
+
+    def test_params(self):
+        self.assertFunctionParameters(student_file.func_with_params, ["a", "b", "c"])

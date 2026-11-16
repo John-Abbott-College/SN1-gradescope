@@ -58,3 +58,8 @@ class JACTestCase(unittest.TestCase):
             code_quality.check_return_paths(tree, filename)
         except code_quality.CodeQualityError as e:
             self.fail(f"❌ {e.args[0]}")
+
+    def assertFunctionParameters(self, student_function, expected_params: list[str]):
+        actual_params = list(inspect.signature(student_function).parameters)
+        self.assertListEqual(actual_params, expected_params, f"❌ {student_function.__name__}: expected parameters {expected_params}, got {actual_params}"
+    )
